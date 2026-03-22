@@ -1,0 +1,22 @@
+{
+    "name": "",
+    "cpf": "",
+    "location": "",
+    "benefits": [
+        {
+            "name": "",
+            "amountReceived": 0,
+            "datails": [
+                {
+                    "mounthYear": "",
+                    "installment": 1,
+                    "state": "",
+                    "city": "",
+                    "classification": "",
+                    "value": 0,
+                    "observation": null
+                }
+            ]
+        }
+    ]
+}
