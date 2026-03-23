@@ -22,28 +22,126 @@ BENEFICIOS = [
     "Novo Bolsa Família"
 ]
 
-async def em_verificacao_humana(page) -> bool:
-    challenge_title = page.get_by_text("Let's confirm you are human")
-    try:
-        return await challenge_title.is_visible(timeout=3000)
-    except PlaywrightTimeoutError:
-        return False
+async def start_browser(playwright):
+    browser = await playwright.chromium.launch(
+        headless=False,
+        args=["--disable-blink-features=AutomationControlled"],
+    )
+    context = await browser.new_context(
+        locale="pt-BR",
+        timezone_id="America/Sao_Paulo",
+    )
+    page = await context.new_page()
+    await page.goto(URL, wait_until="domcontentloaded")
     
+    return browser, context, page
 
-async def extrair_lista_detalhes_beneficio(detail_page, benefit) -> list[dict]:
-    details_link = benefit["detailLink"]
+async def accept_cookies(page):
+    try:
+        await page.locator("#accept-all-btn").click(timeout=3000)
+    except PlaywrightTimeoutError:
+        pass
+    
+async def search_person(page, search_term):
+    await page.locator(f"#{INPUT_ID}").fill(search_term)
+    await page.locator("#box-busca-refinada").wait_for(state="attached")
+    await page.get_by_role("button", name="Refine a Busca").click()
+    
+    try:
+        await page.locator("#box-busca-refinada").wait_for(state="visible", timeout=10000)
+    except PlaywrightTimeoutError:
+        await page.get_by_role("button", name="Refine a Busca").click()
 
+    await page.locator("#btnConsultarPF").click()
+    await page.locator("#infoTermo").filter(has_text=search_term).wait_for()
+  
+async def open_person_page(page):
+    await page.locator("#resultados a.link-busca-nome").first.click()
+    await accept_cookies(page)
+    await page.get_by_role("button", name="Recebimentos de recursos").click()
+    
+async def take_screenshot(page):
+    screenshot_bytes = await page.screenshot(full_page=True)
+    screenshot_base64 = base64.b64encode(screenshot_bytes).decode("utf-8")
+    return screenshot_base64 
+    
+async def get_person_data(page):
+    name = (
+        await page.locator('strong:has-text("Nome")')
+        .locator("..")
+        .locator("span")
+        .inner_text()
+    ).strip()
+    
+    cpf = (
+        await page.locator('strong:has-text("CPF")')
+        .locator("..")
+        .locator("span")
+        .inner_text()
+    ).strip()
+    
+    location = (
+        await page.locator('strong:has-text("Localidade")')
+        .locator("..")
+        .locator("span")
+        .inner_text()
+    ).strip()
+   
+    return {
+        "name": name,
+        "cpf": cpf,
+        "location": location,
+    }
+   
+async def get_benefits_metadata(page):
+    benefits_metadata = []
+    await page.locator("#loadingcollapse-3").wait_for(state="hidden")
+    tables = await page.locator(".br-table").all()
+
+    for table in tables:
+        table_name = (await table.locator("strong").inner_text()).strip()
+
+        if table_name not in BENEFICIOS:
+            continue
+
+        amount_received = (await table.locator("tbody tr td:nth-child(4)").inner_text()).strip()
+        href = await table.locator("a").get_attribute("href")
+        details_link = urljoin(BASE_URL, href)
+
+        benefits_metadata.append(
+            {
+                "name": table_name,
+                "amountReceived": amount_received,
+                "detailLink": details_link,
+            }
+        )
+    
+    return benefits_metadata
+
+async def get_benefits(context, benefits_metadata):
+    benefits = []
+    detail_page = await context.new_page()
+
+    for benefit in benefits_metadata:
+        details = await get_benefit_details(detail_page, benefit["detailLink"])
+        benefits.append({
+            "name": benefit["name"],
+            "amountReceived": benefit["amountReceived"],
+            "details": details
+        })
+
+    await detail_page.close()
+    
+    return benefits
+
+async def get_benefit_details(detail_page, detail_link) -> list[dict]:
     await detail_page.goto(
-        details_link,
+        detail_link,
         wait_until="domcontentloaded",
         referer=BASE_URL,
     )
 
     await detail_page.locator("#accept-all-btn").click(timeout=3000)
-
-
-    if await em_verificacao_humana(detail_page):
-        return []
 
     table = detail_page.locator("section.dados-detalhados table").first
     await table.wait_for(state="visible", timeout=10000)
@@ -52,109 +150,35 @@ async def extrair_lista_detalhes_beneficio(detail_page, benefit) -> list[dict]:
     dataframe.columns = [str(column).strip() for column in dataframe.columns]
     return dataframe.to_dict(orient="records")
 
+def save_as_json(person_data, benefits, screenshot):
+    data = {
+        "personData": person_data,
+        "benefits": benefits,
+        "screenshot": screenshot,
+    }
+    with open("data.json", "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=4)
 
+async def end_browser(browser, context):
+    await context.close()
+    await browser.close()
 
 async def main() -> None:
     async with async_playwright() as playwright:
-        browser = await playwright.chromium.launch(
-            headless=False,
-            args=["--disable-blink-features=AutomationControlled"],
-        )
-        context = await browser.new_context(
-            locale="pt-BR",
-            timezone_id="America/Sao_Paulo",
-        )
-        page = await context.new_page()
-        await page.goto(URL, wait_until="domcontentloaded")
+        browser, context, page = await start_browser(playwright)
 
-        # Pesquisar pessoa fisica
-        await page.locator("#accept-all-btn").click()
-        await page.locator("#termo").fill(SEARCH_TERM)
-        await page.get_by_role("button", name="Refine a Busca").click()
-        await page.locator("#btnConsultarPF").click()
+        await accept_cookies(page)
+        await search_person(page, SEARCH_TERM)
+        await open_person_page(page)
         
+        screenshot = await take_screenshot(page)
+        person_data = await get_person_data(page)
+        benefits_metadata = await get_benefits_metadata(page)
+        benefits = await get_benefits(context, benefits_metadata)
+
+        save_as_json(person_data, benefits, screenshot)
         
-        await page.locator("#infoTermo").filter(has_text=SEARCH_TERM).wait_for()
-
-        await page.locator("#resultados a.link-busca-nome").first.click()
-        await page.locator("#accept-all-btn").click()
-        await page.get_by_role("button", name="Recebimentos de recursos").click()
-
-        # Tirar print da tela
-        screenshot_bytes = await page.screenshot(full_page=True)
-        screenshot_base64 = base64.b64encode(screenshot_bytes).decode("utf-8")
-
-        # Obter dados pessoais
-        name = (
-            await page.locator('strong:has-text("Nome")')
-            .locator("..")
-            .locator("span")
-            .inner_text()
-        ).strip()
-        
-        cpf = (
-            await page.locator('strong:has-text("CPF")')
-            .locator("..")
-            .locator("span")
-            .inner_text()
-        ).strip()
-        
-        location = (
-            await page.locator('strong:has-text("Localidade")')
-            .locator("..")
-            .locator("span")
-            .inner_text()
-        ).strip()
-        
-        benefits = []
-
-        # Obter dados dos benefícios
-        await page.locator("#loadingcollapse-3").wait_for(state="hidden")
-        tables = await page.locator(".br-table").all()
-
-        for table in tables:
-            table_name = (await table.locator("strong").inner_text()).strip()
-
-            if table_name not in BENEFICIOS:
-                continue
-
-            amount_received = (await table.locator("tbody tr td:nth-child(4)").inner_text()).strip()
-            href = await table.locator("a").get_attribute("href")
-            details_link = urljoin(BASE_URL, href)
-
-            benefits.append(
-                {
-                    "name": table_name,
-                    "amountReceived": amount_received,
-                    "detailLink": details_link,
-                }
-            )
-        
-        
-        detail_page = await context.new_page()
-
-        for benefit in benefits:
-            details = await extrair_lista_detalhes_beneficio(detail_page, benefit)
-            benefit["details"] = details
-
-        await detail_page.close()
-
-        # Salvar dados em JSON
-        data = {
-            "name": name,
-            "cpf": cpf,
-            "location": location,
-            "benefits": benefits,
-            "screenshot": screenshot_base64,
-            "lastUpdate": pd.Timestamp.now().isoformat(),
-        }
-
-        with open("data.json", "w") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-
-        await page.wait_for_timeout(3000)
-        await context.close()
-        await browser.close()
+        await end_browser(browser, context)
 
 
 if __name__ == "__main__":
