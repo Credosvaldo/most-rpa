@@ -1,0 +1,14 @@
+{
+    "searchTerm": "1.638.008.751-7",
+    "options": {
+        "publicServers": false,
+        "socialProgramBeneficiary": false,
+        "federalGovernmentPaymentCardHolder": false,
+        "civilDefenseCardHolder": false,
+        "activeSanction": false,
+        "officialPropertyOccupant": false,
+        "federalGovernmentContract": false,
+        "publicFundBeneficiary": false,
+        "invoiceIssuer": false
+    }
+}
