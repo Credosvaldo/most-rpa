@@ -6,23 +6,13 @@ from io import StringIO
 from urllib.parse import urljoin
 
 import pandas as pd
+from flask import Flask, jsonify, request
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import async_playwright
 
 BASE_URL = "https://portaldatransparencia.gov.br/"
 URL = f"{BASE_URL}pessoa-fisica/busca/lista?pagina=1&tamanhoPagina=10"
-HEADLESS = False
-
-SEARCH_TERM = "1.638.008.751-7"
-publicServers = True
-socialProgramBeneficiary = True
-federalGovernmentPaymentCardHolder = True
-civilDefenseCardHolder = True
-activeSanction = True
-officialPropertyOccupant = True
-federalGovernmentContract = True
-publicFundBeneficiary = True
-invoiceIssuer = True
+HEADLESS = True
 
 INPUT_ID = "termo"
 
@@ -31,6 +21,20 @@ BENEFICIOS = [
     "Auxílio Emergencial",  
     "Beneficiário de Bolsa Família",
     "Novo Bolsa Família"
+]
+
+app = Flask(__name__)
+
+FILTER_KEYS = [
+    "publicServers",
+    "socialProgramBeneficiary",
+    "federalGovernmentPaymentCardHolder",
+    "civilDefenseCardHolder",
+    "activeSanction",
+    "officialPropertyOccupant",
+    "federalGovernmentContract",
+    "publicFundBeneficiary",
+    "invoiceIssuer",
 ]
 
 def normalize_column_name(name):
@@ -80,27 +84,37 @@ async def accept_cookies(page):
     except PlaywrightTimeoutError:
         pass
 
-async def filter_options(page):
-    if publicServers:
+def parse_bool(value: str | None) -> bool:
+    if value is None:
+        return False
+    return value.strip().lower() in {"1", "true", "t", "yes", "y", "on"}
+
+
+def get_filters_from_request() -> dict[str, bool]:
+    return {key: parse_bool(request.args.get(key)) for key in FILTER_KEYS}
+
+
+async def filter_options(page, filters: dict[str, bool]):
+    if filters["publicServers"]:
         await page.locator("#servidorPublico").check(force=True)
-    if socialProgramBeneficiary:
+    if filters["socialProgramBeneficiary"]:
         await page.locator("#beneficiarioProgramaSocial").check(force=True)
-    if federalGovernmentPaymentCardHolder:
+    if filters["federalGovernmentPaymentCardHolder"]:
         await page.locator("#portadorCPGF").check(force=True)
-    if civilDefenseCardHolder:
+    if filters["civilDefenseCardHolder"]:
         await page.locator("#portadorCPDC").check(force=True)
-    if activeSanction:
+    if filters["activeSanction"]:
         await page.locator("#sancaoVigente").check(force=True)
-    if officialPropertyOccupant:
+    if filters["officialPropertyOccupant"]:
         await page.locator("#ocupanteImovelFuncional").check(force=True)
-    if federalGovernmentContract:
+    if filters["federalGovernmentContract"]:
         await page.locator("#possuiContrato").check(force=True)
-    if publicFundBeneficiary:
+    if filters["publicFundBeneficiary"]:
         await page.locator("#favorecidoRecurso").check(force=True)
-    if invoiceIssuer:
+    if filters["invoiceIssuer"]:
         await page.locator("#emitenteNfe").check(force=True)
 
-async def search_person(page, search_term):
+async def search_person(page, search_term, filters: dict[str, bool]):
     print("Buscando pessoa...")
     await page.locator(f"#{INPUT_ID}").wait_for(state="visible")
     await page.locator(f"#{INPUT_ID}").fill(search_term)
@@ -112,7 +126,7 @@ async def search_person(page, search_term):
     except PlaywrightTimeoutError:
         await page.get_by_role("button", name="Refine a Busca").click()
 
-    await filter_options(page)
+    await filter_options(page, filters)
     await page.locator("#btnConsultarPF").click()
     await page.wait_for_function("() => document.getElementById('resultados').textContent.trim() === ''")
     await page.locator("#infoTermo").filter(has_text=search_term).wait_for()
@@ -248,15 +262,8 @@ async def get_benefit_details(detail_page, detail_link) -> list[dict]:
     dataframe.columns = [normalize_column_name(str(column).strip()) for column in dataframe.columns]
     return dataframe.to_dict(orient="records")
 
-def save_as_json(person_data, benefits, screenshot):
+def save_as_json(data: dict):
     print("Salvando dados em JSON...")
-    data = {
-        "name": person_data["name"],
-        "cpf": person_data["cpf"],
-        "location": person_data["location"],
-        "benefits": benefits,
-        "screenshot": screenshot,
-    }
     with open("data.json", "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=4)
 
@@ -264,23 +271,45 @@ async def end_browser(browser, context):
     await context.close()
     await browser.close()
 
-async def main() -> None:
+async def run_scraper(search_term: str, filters: dict[str, bool]) -> dict:
     async with async_playwright() as playwright:
         browser, context, page = await start_browser(playwright)
-        
-        await accept_cookies(page)
-        await search_person(page, SEARCH_TERM)
-        await open_person_page(page)
-        
-        screenshot = await take_screenshot(page)
-        person_data = await get_person_data(page)   
-        benefits_metadata = await get_benefits_metadata(page)
-        benefits = await get_benefits(context, benefits_metadata)
+        try:
+            await accept_cookies(page)
+            await search_person(page, search_term, filters)
+            await open_person_page(page)
 
-        save_as_json(person_data, benefits, screenshot)
-        
-        await end_browser(browser, context)
+            screenshot = await take_screenshot(page)
+            person_data = await get_person_data(page)
+            benefits_metadata = await get_benefits_metadata(page)
+            benefits = await get_benefits(context, benefits_metadata)
+
+            data = {
+                "name": person_data["name"],
+                "cpf": person_data["cpf"],
+                "location": person_data["location"],
+                "benefits": benefits,
+                "screenshot": screenshot,
+            }
+            save_as_json(data)
+            return data
+        finally:
+            await end_browser(browser, context)
+
+@app.get("/run/<search_term>")
+def run_endpoint(search_term: str):
+    filters = get_filters_from_request()
+    try:
+        data = asyncio.run(run_scraper(search_term=search_term, filters=filters))
+        return data
+    except Exception as exc:
+        return jsonify({"status": "error", "message": str(exc)}), 500
+
+
+@app.get("/health")
+def healthcheck():
+    return jsonify({"status": "ok"}), 200
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    app.run(host="0.0.0.0", port=8000, debug=False)
